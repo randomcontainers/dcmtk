@@ -1,0 +1,250 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=ubuntu:26.04
+
+FROM ${BASE_IMAGE} AS build
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+# The base image's packages are recorded before anything is installed, so that
+# runtime-deps can leave them out. Every image that installs runtime-deps is
+# built on the same base.
+RUN dpkg-query -W -f '${Package}\n' | LC_ALL=C sort -u > /tmp/base-packages; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      cmake \
+      git \
+      libpng-dev \
+      libssl-dev \
+      libtiff-dev \
+      libxml2-dev \
+      ninja-build \
+      zlib1g-dev; \
+    rm -rf /var/lib/apt/lists/*
+
+# OFFIS publishes its release tarballs without checksums or signatures, so the
+# release tag is cloned and must point to the commit pinned in package.yml.
+ARG VERSION
+ARG SOURCE_COMMIT
+RUN printf '%s\n' "${VERSION}" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' \
+      || { echo "unexpected VERSION: ${VERSION}" >&2; exit 1; }; \
+    printf '%s\n' "${SOURCE_COMMIT}" | grep -Eqx '[0-9a-f]{40}' \
+      || { echo "SOURCE_COMMIT must be a full commit id" >&2; exit 1; }; \
+    git -c advice.detachedHead=false clone --quiet --depth 1 --branch "DCMTK-${VERSION}" \
+      https://github.com/DCMTK/dcmtk.git /src/dcmtk; \
+    test "$(git -C /src/dcmtk rev-parse HEAD)" = "${SOURCE_COMMIT}" \
+      || { echo "tag DCMTK-${VERSION} is not commit ${SOURCE_COMMIT}" >&2; exit 1; }
+WORKDIR /src/dcmtk
+ARG JOBS
+# Every optional library is named. CMake turns off a library it cannot find
+# with only a status line, so the summary is checked after configuring.
+# Character sets are converted by DCMTK's own oficonv with its tables built
+# in. OpenJPEG and libsndfile are only used by DCMTK modules that are not
+# public, and the TCP wrappers access control (libwrap) is left out. Large
+# file support uses the plain stdio calls, as off_t is 64 bits wide on amd64
+# and arm64. The RUNPATH keeps the tools on the libraries built here: on
+# arm64 the loader searches /usr/lib/aarch64-linux-gnu before /usr/local/lib.
+RUN set -- \
+      -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DCMAKE_INSTALL_LIBDIR=lib \
+      -DCMAKE_INSTALL_RPATH=/usr/local/lib \
+      -DBUILD_SHARED_LIBS=ON \
+      -DDCMTK_WITH_OPENSSL=ON \
+      -DDCMTK_WITH_PNG=ON \
+      -DDCMTK_WITH_TIFF=ON \
+      -DDCMTK_WITH_XML=ON \
+      -DDCMTK_WITH_ZLIB=ON \
+      -DDCMTK_WITH_ICONV=OFF \
+      -DDCMTK_ENABLE_CHARSET_CONVERSION=oficonv \
+      -DDCMTK_ENABLE_BUILTIN_OFICONV_DATA=ON \
+      -DDCMTK_WITH_OPENJPEG=OFF \
+      -DDCMTK_WITH_SNDFILE=OFF \
+      -DDCMTK_WITH_WRAP=OFF \
+      -DDCMTK_WITH_DOXYGEN=OFF \
+      -DDCMTK_ENABLE_MANPAGES=OFF \
+      -DDCMTK_ENABLE_PRIVATE_TAGS=ON \
+      -DDCMTK_ENABLE_LFS=lfs; \
+    echo "$*" > /tmp/cmake-options; \
+    cmake -S . -B build "$@" | tee /tmp/cmake.log; \
+    for info in \
+      'DCMTK TIFF support will be enabled' \
+      'DCMTK PNG support will be enabled' \
+      'DCMTK OPENSSL support will be enabled' \
+      'DCMTK XML support will be enabled' \
+      'DCMTK ZLIB support will be enabled' \
+      'Building DCMTK with character set conversion support using built-in oficonv module' \
+      "DCMTK's builtin private dictionary support will be enabled" \
+      'Building DCMTK with large file support (LFS)'; do \
+      grep -Fq -e "-- Info: $info" /tmp/cmake.log || { echo "not in the CMake output: $info" >&2; exit 1; }; \
+    done; \
+    cmake --build build -j"${JOBS:-$(nproc)}"; \
+    DESTDIR=/out cmake --install build --strip
+
+# DCMTK installs its data and configuration files in directories named after
+# the version; the links give them names that stay the same across releases.
+# The conversion tables are built into liboficonv, which reads table files
+# only when DCMICONVPATH names another directory, so the copies DCMTK
+# installs in csmapper and esdb are left out, as are mkcsmapper and mkesdb,
+# which generate them.
+RUN out=/out/usr/local; \
+    rm -rf "$out/include" "$out/lib/cmake" "$out/lib/pkgconfig" "$out/share/doc" "$out/share/man"; \
+    rm -rf "$out/share/dcmtk-${VERSION}/csmapper" "$out/share/dcmtk-${VERSION}/esdb"; \
+    rm -f "$out/bin/mkcsmapper" "$out/bin/mkesdb"; \
+    test -z "$(find "$out" -name '*.a' -print -quit)" || { echo "static libraries were installed" >&2; exit 1; }; \
+    tables="$(find "$out" \( -name '*.mps' -o -name '*.esdb' -o -name '*.pvdb' \) -print)"; \
+    test -z "$tables" || { printf '%s\n' "$tables" >&2; echo "conversion table files were installed" >&2; exit 1; }; \
+    for f in "etc/dcmtk-${VERSION}/storescp.cfg" "share/dcmtk-${VERSION}/dicom.dic" "share/dcmtk-${VERSION}/private.dic"; do \
+      test -f "$out/$f" || { echo "missing: /usr/local/$f" >&2; exit 1; }; \
+    done; \
+    ln -s "dcmtk-${VERSION}" "$out/etc/dcmtk"; \
+    ln -s "dcmtk-${VERSION}" "$out/share/dcmtk"; \
+    for f in "$out"/bin/* "$out"/lib/lib*.so.*; do \
+      if [ -L "$f" ]; then continue; fi; \
+      readelf -d "$f" > /tmp/dynamic; \
+      grep -Eq 'Library (rpath|runpath): \[/usr/local/lib\]' /tmp/dynamic \
+        || { cat /tmp/dynamic >&2; echo "$f has no RUNPATH /usr/local/lib" >&2; exit 1; }; \
+    done; \
+    run() { tool=$1; shift; LD_LIBRARY_PATH="$out/lib" "$out/bin/$tool" "$@"; }; \
+    run dcmdump --version > /tmp/dcmdump-version; \
+    case "$(sed -n 1p /tmp/dcmdump-version)" in \
+      "\$dcmtk: dcmdump v${VERSION} "*) ;; \
+      *) cat /tmp/dcmdump-version >&2; echo "dcmdump is not version ${VERSION}" >&2; exit 1 ;; \
+    esac; \
+    grep -Fq 'with built-in data files' /tmp/dcmdump-version || { cat /tmp/dcmdump-version >&2; exit 1; }; \
+    run dcm2img --version > /tmp/dcm2img-version; \
+    run xml2dcm --version > /tmp/xml2dcm-version; \
+    run storescu --version > /tmp/storescu-version; \
+    for check in dcm2img:LIBTIFF dcm2img:LIBPNG dcm2img:ZLIB xml2dcm:LIBXML storescu:OpenSSL; do \
+      grep -Eq "^- ${check#*:}[ ,]" "/tmp/${check%%:*}-version" \
+        || { cat "/tmp/${check%%:*}-version" >&2; echo "${check%%:*} is built without ${check#*:}" >&2; exit 1; }; \
+    done; \
+    run dcmtk --help > /tmp/dcmtk-help; \
+    if grep -Fq 'denotes tools that cannot be called' /tmp/dcmtk-help; then \
+      cat /tmp/dcmtk-help >&2; echo "the dcmtk tool cannot find some of the tools it calls" >&2; exit 1; \
+    fi
+
+ARG BASE_IMAGE
+# COPYRIGHT holds DCMTK's license and the notices of the code compiled into it;
+# the build stops if one of those that the license label names is missing.
+# The IJG, CharLS and log4cplus license files come from the source tree.
+# COPYRIGHT quotes only some of the notices in oficonv's Citrus sources, so
+# NOTICE.oficonv collects the comment blocks at the top of each file, except
+# the Windows-only ones, which are not compiled. The Unicode, Inc. notices
+# are cut from the mapping files that the built-in conversion tables were
+# generated from. runtime-deps lists the packages that own the libraries the
+# tools load, minus the base image's packages, plus the packages in
+# runtime-deps.ubuntu. That file adds openssl-provider-legacy: dcmsign,
+# dcmp2pgm, dcmpsprt, dcmprscu and dcmprscp load OpenSSL's legacy provider
+# when they start and print an error without it.
+RUN --mount=type=bind,source=runtime-deps.ubuntu,target=/tmp/runtime-deps.extra \
+    export LC_ALL=C; \
+    meta=/out/usr/local/share/randomcontainers/dcmtk; \
+    mkdir -p "$meta/licenses"; \
+    cp COPYRIGHT "$meta/licenses/COPYRIGHT"; \
+    cp dcmjpeg/docs/ijg_readme.txt "$meta/licenses/README.ijg"; \
+    cp dcmjpls/docs/License.txt "$meta/licenses/LICENSE.charls"; \
+    cp oflog/docs/LICENSE "$meta/licenses/LICENSE.log4cplus"; \
+    { \
+      echo 'oficonv is derived from the iconv implementation of FreeBSD by the Citrus'; \
+      echo 'Project. These are the notices at the top of its source files, each after'; \
+      echo 'the list of files that carry it.'; \
+      echo; \
+      awk 'FILENAME ~ /\/windows_/ { next }; FNR == 1 { body = 0; inc = 0; blk = "" }; body { next }; \
+          !inc && /^[[:space:]]*$/ { next }; !inc && /^\/\*/ { inc = 1; blk = "" }; !inc { body = 1; next }; \
+          { blk = blk $0 "\n" }; \
+          /\*\// { inc = 0; if (blk ~ /Copyright|\([Cc]\)|Redistribution|Permission/ && blk !~ /OFFIS e\.V\./) { \
+            if (!(blk in files)) { order[++n] = blk; files[blk] = FILENAME } else files[blk] = files[blk] ", " FILENAME } }; \
+          END { for (i = 1; i <= n; i++) printf "%s:\n\n%s\n", files[order[i]], order[i] }' \
+        oficonv/include/dcmtk/oficonv/*.h oficonv/libsrc/*.c oficonv/libsrc/*.h; \
+    } > "$meta/licenses/NOTICE.oficonv"; \
+    for notice in 'Copyright (c)2006 Citrus Project' 'This product includes software developed by Phase One, Inc.'; do \
+      grep -Fq "$notice" "$meta/licenses/NOTICE.oficonv" || { echo "NOTICE.oficonv lacks: $notice" >&2; exit 1; }; \
+    done; \
+    for notice in \
+      'Copyright (C) 1994-' \
+      'Independent JPEG Group' \
+      'Jef Poskanzer' \
+      'by the University of California, Berkeley' \
+      'This product includes software developed by Phase One, Inc.' \
+      'Aladdin Free Public License' \
+      'Copyright (C) 1993, RSNA and Washington University' \
+      'OFFIS, Oldenburg University and CERIUM' \
+      'Bob Withers' \
+      'Citrus Project' \
+      'Serge Zaitsev' \
+      'Gregory Pakosz'; do \
+      grep -Fq "$notice" COPYRIGHT || { echo "COPYRIGHT no longer has: $notice" >&2; exit 1; }; \
+    done; \
+    grep -q 'Apache License' "$meta/licenses/LICENSE.log4cplus"; \
+    src=oficonv/datasrc/csmapper; \
+    { \
+      echo 'The character set conversion tables built into liboficonv are generated'; \
+      echo "from the mapping files in $src."; \
+      echo 'Most of them were made from mapping data provided by Unicode, Inc. and'; \
+      echo 'carry the following copyright lines and one of the two notices below. The'; \
+      echo 'GB user-defined area, GBK extension and GB18030 tables carry the 2006'; \
+      echo 'Citrus Project notice instead, which is in NOTICE.oficonv.'; \
+      echo; \
+      grep -rh 'Copyright (c).*Unicode, Inc\.' "$src" | sed 's/^#[[:space:]]*//' | sort -u; \
+      echo; \
+      echo "From $src/ISO-8859/ISO-8859-2%UCS.src and others:"; \
+      echo; \
+      sed -n '/This file is provided as-is/,/^#[[:space:]]*attached\./p' "$src/ISO-8859/ISO-8859-2%UCS.src" \
+        | sed 's/^#[[:space:]]*//'; \
+      echo; \
+      echo "From $src/JIS/JISX0208@1990%UCS.src and others:"; \
+      echo; \
+      sed -n '/This file is provided as-is/,/whether for profit or not\./p' "$src/JIS/JISX0208@1990%UCS.src" \
+        | sed 's/^#[[:space:]]*//'; \
+    } > "$meta/licenses/NOTICE.unicode"; \
+    grep -q '^Copyright (c) .*Unicode, Inc\.' "$meta/licenses/NOTICE.unicode"; \
+    grep -q 'hereby grants the right to freely use' "$meta/licenses/NOTICE.unicode"; \
+    grep -q 'Recipient is granted the right to make copies' "$meta/licenses/NOTICE.unicode"; \
+    for f in "$meta"/licenses/*; do test -s "$f"; done; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://github.com/DCMTK/dcmtk.git@${SOURCE_COMMIT}" \
+      "https://github.com/DCMTK/dcmtk/tree/${SOURCE_COMMIT}" \
+      > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(c++ --version | sed -n 1p)"; \
+      echo "commit: ${SOURCE_COMMIT}"; \
+      echo "cmake: $(cat /tmp/cmake-options)"; \
+      grep -E '^-- Info: ' /tmp/cmake.log; \
+      cat /tmp/dcmdump-version; \
+    } > "$meta/buildinfo"; \
+    find /out/usr/local -type f \( -perm -u+x -o -name '*.so*' \) -print0 \
+      | xargs -0 env LD_LIBRARY_PATH=/out/usr/local/lib ldd > /tmp/ldd 2>&1 || true; \
+    if grep 'not found' /tmp/ldd; then exit 1; fi; \
+    awk '$2 == "=>" && $3 ~ /^\// && $3 !~ /^\/out\// { print $3 }' /tmp/ldd | sort -u > /tmp/libs; \
+    test -s /tmp/libs; \
+    while read -r lib; do \
+      real="$(readlink -f "$lib")"; \
+      dpkg-query --search "*${real#/usr}"; \
+    done < /tmp/libs | cut -d: -f1 | sort -u | comm -23 - /tmp/base-packages > /tmp/elf-deps; \
+    sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"; \
+    if grep -E '^libdcmtk' "$meta/runtime-deps"; then \
+      echo "runtime-deps must not pull in the distro's DCMTK libraries" >&2; exit 1; \
+    fi
+
+FROM ${BASE_IMAGE} AS slim
+ARG DEBIAN_FRONTEND=noninteractive
+COPY --link --from=build /out/usr/local/ /usr/local/
+# The tools and libraries find each other in /usr/local/lib through their
+# RUNPATH, and other programs through the cache that ldconfig writes.
+RUN set -eu; \
+    apt-get update; \
+    xargs apt-get install -y --no-install-recommends ca-certificates tini < /usr/local/share/randomcontainers/dcmtk/runtime-deps; \
+    rm -rf /var/lib/apt/lists/*; \
+    ldconfig; \
+    install -d -m 1777 /work /cache
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "dcmtk"]
+CMD ["--help"]
