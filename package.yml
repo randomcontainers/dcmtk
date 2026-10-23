@@ -1,0 +1,292 @@
+name: dcmtk
+title: DCMTK
+summary: The OFFIS DICOM toolkit, with tools that dump, convert, compress and edit DICOM files, render images, and send or receive them over the network.
+homepage: https://dicom.offis.de/dcmtk
+# DCMTK (BSD-3-Clause) and the code compiled into it under other terms: the
+# Phase One notice in oficonv's MS-Kanji module (BSD-4-Clause),
+# OFStandard::ftoa (BSD-4.3TAHOE), the IJG JPEG library, Jef Poskanzer's
+# scaling and quantization code (HPND-Pbmplus), log4cplus (BSD-2-Clause and
+# Apache-2.0), the Citrus iconv code (BSD-2-Clause and BSD-3-Clause), jsmn
+# and whereami (MIT), the XML parser in ofstd (BSD-style for projects related
+# to DCMTK, AFPL otherwise), the 1993 RSNA demonstration notices of OFFIS,
+# Oldenburg University and CERIUM and of RSNA and Washington University, Bob
+# Withers' Base64 code, and the notices in the Unicode, Inc. mapping files
+# behind the character set tables built into oficonv
+# (LicenseRef-Unicode-Mappings; Unicode-TOU is the terms of use of the
+# Unicode web site, not these notices). ISC is the notice of oficonv's
+# strlcpy fallback, which is only compiled on a C library without strlcpy.
+# glibc and musl both have one, and ISC stays in the label as a precaution.
+license: BSD-3-Clause AND BSD-2-Clause AND BSD-4-Clause AND BSD-4.3TAHOE AND Apache-2.0 AND IJG AND HPND-Pbmplus AND ISC AND MIT AND LicenseRef-DCMTK-or-AFPL AND LicenseRef-OFFIS-RSNA-1993 AND LicenseRef-Withers-base64 AND LicenseRef-Unicode-Mappings
+upstream:
+  source: github-tag
+  repository: DCMTK/dcmtk
+  # Release tags look like DCMTK-3.7.1. Snapshot tags (DCMTK-3.6.5+_20210308)
+  # and the moving "latest" tag do not match. Tags are read instead of GitHub
+  # releases, because upstream has published some releases weeks after
+  # tagging them.
+  tag-pattern: '^DCMTK-(\d+\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: semver
+  version: 3.7.1
+  # OFFIS publishes its tarballs without checksums or signatures, and the tags
+  # are not signed, so the build clones the tag and checks that it is this
+  # commit.
+  git:
+    url: https://github.com/DCMTK/dcmtk.git
+    tag: 'DCMTK-{version}'
+    commit: 108acdae424d6999b2e398243938d8c563315ecf
+image:
+  entrypoint: [dcmtk]
+  cmd: [--help]
+test:
+  - |
+    fail() { echo "$*" >&2; exit 1; }
+    dcmdump --version > dcmdump-version.txt
+    first=$(head -n 1 dcmdump-version.txt)
+    case "$first" in
+      "\$dcmtk: dcmdump v$VERSION "*) ;;
+      *) fail "unexpected first line of dcmdump --version: $first" ;;
+    esac
+    dcmtk --version > dcmtk-version.txt 2>&1
+    case "$(head -n 1 dcmtk-version.txt)" in
+      "\$dcmtk: dcmtk v$VERSION "*) ;;
+      *) cat dcmtk-version.txt >&2; fail 'unexpected output of dcmtk --version' ;;
+    esac
+    # The charset tables are built into liboficonv, so no data files are read.
+    for line in '- ZLIB, Version ' '- Citrus iconv, ' 'with built-in data files'; do
+      grep -Fq -e "$line" dcmdump-version.txt || { cat dcmdump-version.txt >&2; fail "dcmdump --version lacks: $line"; }
+    done
+    dcm2img --version > dcm2img-version.txt
+    for line in '- LIBTIFF, Version ' '- LIBPNG, Version '; do
+      grep -Fq -e "$line" dcm2img-version.txt || { cat dcm2img-version.txt >&2; fail "dcm2img --version lacks: $line"; }
+    done
+    xml2dcm --version > xml2dcm-version.txt
+    grep -Fq -e '- LIBXML, Version ' xml2dcm-version.txt || { cat xml2dcm-version.txt >&2; fail 'xml2dcm is built without libxml2'; }
+    storescu --version > storescu-version.txt
+    grep -Fq -e '- OpenSSL ' storescu-version.txt || { cat storescu-version.txt >&2; fail 'storescu is built without OpenSSL'; }
+    # dcmtk --help marks every tool it cannot find next to itself.
+    dcmtk --help > help.txt
+    grep -Eq '^    dump +- ' help.txt || { cat help.txt >&2; fail 'dcmtk --help does not list the dump alias'; }
+    if grep -Fq 'denotes tools that cannot be called' help.txt; then
+      grep -F '*' help.txt >&2
+      fail 'dcmtk --help lists missing tools'
+    fi
+    if command -v mkcsmapper > /dev/null || command -v mkesdb > /dev/null; then
+      fail 'the oficonv table generators should not be installed'
+    fi
+    for f in "/usr/local/share/dcmtk-$VERSION/dicom.dic" /usr/local/share/dcmtk/private.dic /usr/local/etc/dcmtk/storescp.cfg; do
+      test -f "$f" || fail "missing: $f"
+    done
+    # dcmsign loads OpenSSL's legacy provider before it reads its options and
+    # logs an error if the provider is missing.
+    dcmsign --version > dcmsign-version.txt 2> dcmsign.err
+    if [ -s dcmsign.err ]; then cat dcmsign.err >&2; fail 'dcmsign printed errors, the OpenSSL legacy provider may be missing'; fi
+    grep -Fq -e '- OpenSSL ' dcmsign-version.txt || { cat dcmsign-version.txt >&2; fail 'dcmsign is built without OpenSSL'; }
+  - |
+    fail() { echo "$*" >&2; exit 1; }
+    # A 16x16 8-bit image whose rows are shifted runs of letters.
+    s=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz
+    : > pix.raw
+    r=0
+    while [ "$r" -lt 16 ]; do
+      printf '%s' "$s" | cut -c "$((r + 1))-$((r + 16))" | tr -d '\n' >> pix.raw
+      r=$((r + 1))
+    done
+    size=$(wc -c < pix.raw | tr -d ' ')
+    test "$size" -eq 256 || fail "pix.raw has $size bytes, expected 256"
+    printf '%s\n' \
+      '(0008,0016) UI [1.2.840.10008.5.1.4.1.1.7]' \
+      '(0008,0060) CS [OT]' \
+      '(0008,0064) CS [WSD]' \
+      '(0010,0010) PN [Doe^John]' \
+      '(0010,0020) LO [RC0001]' \
+      '(0020,0013) IS [1]' \
+      '(0028,0002) US 1' \
+      '(0028,0004) CS [MONOCHROME2]' \
+      '(0028,0010) US 16' \
+      '(0028,0011) US 16' \
+      '(0028,0100) US 8' \
+      '(0028,0101) US 8' \
+      '(0028,0102) US 7' \
+      '(0028,0103) US 0' \
+      '(7fe0,0010) OB =pix.raw' > img.txt
+    dump2dcm +Ug +te img.txt img.dcm
+    # Warnings here would mean that the data dictionary was not found.
+    dcmdump img.dcm > img.dump 2> img.err
+    if [ -s img.err ]; then cat img.err >&2; fail 'dcmdump printed warnings'; fi
+    grep -Eq '^\(0028,0010\) US 16 ' img.dump || { cat img.dump >&2; fail 'Rows is not 16'; }
+    grep -Fq 'SecondaryCaptureImageStorage' img.dump || { cat img.dump >&2; fail 'the SOP class has no name'; }
+    dcmtk dump img.dcm > proxy.dump
+    cmp img.dump proxy.dump || fail 'dcmtk dump and dcmdump print different output'
+    dcmodify -nb -m '(0010,0010)=Doe^Jane' img.dcm
+    dcmdump img.dcm > modified.dump
+    grep -Fq '(0010,0010) PN [Doe^Jane]' modified.dump || { grep -F '(0010,0010)' modified.dump >&2; fail 'dcmodify did not change PatientName'; }
+  - |
+    fail() { echo "$*" >&2; exit 1; }
+    pixels() {
+      rm -rf "px-$1"
+      mkdir "px-$1"
+      dcmdump +W "px-$1" "$1" > /dev/null
+      cmp "px-$1/$1.0.raw" pix.raw || fail "the pixel data of $1 differs from pix.raw"
+    }
+    xfer() {
+      dcmdump -Un "$1" > "$1.txt"
+      grep -Fq "(0002,0010) UI [$2]" "$1.txt" || { grep -F '(0002,0010)' "$1.txt" >&2; fail "$1 is not in transfer syntax $2"; }
+    }
+    dcmcjpeg img.dcm jpeg.dcm
+    xfer jpeg.dcm 1.2.840.10008.1.2.4.70
+    dcmdjpeg jpeg.dcm jpeg-out.dcm
+    pixels jpeg-out.dcm
+    dcmcjpls img.dcm jls.dcm
+    xfer jls.dcm 1.2.840.10008.1.2.4.80
+    dcmdjpls jls.dcm jls-out.dcm
+    pixels jls-out.dcm
+    dcmcrle img.dcm rle.dcm
+    xfer rle.dcm 1.2.840.10008.1.2.5
+    dcmdrle rle.dcm rle-out.dcm
+    pixels rle-out.dcm
+    dcmconv +td img.dcm deflated.dcm
+    xfer deflated.dcm 1.2.840.10008.1.2.1.99
+    dcmconv +te deflated.dcm inflated.dcm
+    pixels inflated.dcm
+  - |
+    fail() { echo "$*" >&2; exit 1; }
+    pixels() {
+      rm -rf "px-$1"
+      mkdir "px-$1"
+      dcmdump +W "px-$1" "$1" > /dev/null
+      cmp "px-$1/$1.0.raw" pix.raw || fail "the pixel data of $1 differs from pix.raw"
+    }
+    dcm2img +on img.dcm img.png
+    head -c 8 img.png > png.head
+    printf '\211PNG\r\n\032\n' > png.sig
+    cmp png.head png.sig || fail 'img.png does not start with the PNG signature'
+    dcm2img +ot img.dcm img.tif
+    head -c 4 img.tif > tif.head
+    printf 'II*\000' > tif.sig
+    cmp tif.head tif.sig || fail 'img.tif does not start with a little-endian TIFF header'
+    # Without a VOI window, 8-bit values reach the BMP unchanged.
+    dcm2img +ob img.dcm img.bmp
+    img2dcm -i BMP img.bmp bmp.dcm
+    pixels bmp.dcm
+  - |
+    fail() { echo "$*" >&2; exit 1; }
+    pixels() {
+      rm -rf "px-$1"
+      mkdir "px-$1"
+      dcmdump +W "px-$1" "$1" > /dev/null
+      cmp "px-$1/$1.0.raw" pix.raw || fail "the pixel data of $1 differs from pix.raw"
+    }
+    name() {
+      dcmdump "$1" > "$1.txt"
+      grep -Fq '(0010,0010) PN [Doe^Jane]' "$1.txt" || { grep -F '(0010,0010)' "$1.txt" >&2; fail "$1 lost PatientName"; }
+    }
+    dcm2json img.dcm img.json
+    json2dcm img.json json.dcm
+    pixels json.dcm
+    name json.dcm
+    dcm2xml +M +Wb img.dcm img.xml
+    xml2dcm img.xml xml.dcm
+    pixels xml.dcm
+    name xml.dcm
+  - |
+    fail() { echo "$*" >&2; exit 1; }
+    # 200 nested sequences: json2dcm and xml2dcm must refuse them with an error
+    # instead of recursing until the stack overflows.
+    awk 'BEGIN {
+      for (i = 0; i < 200; i++) printf "%s", "{\"00400275\":{\"vr\":\"SQ\",\"Value\":["
+      printf "{}"
+      for (i = 0; i < 200; i++) printf "]}}"
+      print ""
+    }' > deep.json
+    awk 'BEGIN {
+      printf "<?xml version=\"1.0\"?>\n<data-set>"
+      for (i = 0; i < 200; i++) printf "<sequence tag=\"0040,0275\" vr=\"SQ\"><item>"
+      for (i = 0; i < 200; i++) printf "</item></sequence>"
+      print "</data-set>"
+    }' > deep.xml
+    for tool in json2dcm xml2dcm; do
+      case $tool in json2dcm) input=deep.json ;; *) input=deep.xml ;; esac
+      status=0
+      "$tool" "$input" "deep-$tool.dcm" > "deep-$tool.log" 2>&1 || status=$?
+      if [ "$status" -eq 0 ] || [ "$status" -ge 128 ]; then
+        cat "deep-$tool.log" >&2
+        fail "$tool exited with status $status, expected an error"
+      fi
+      grep -Fq 'maximum sequence nesting level' "deep-$tool.log" || { cat "deep-$tool.log" >&2; fail "$tool did not report the nesting limit"; }
+    done
+  - |
+    fail() { echo "$*" >&2; exit 1; }
+    # ISO_IR 101 is Latin-2, where byte 0xB3 is U+0142. The table files are not
+    # installed, so converting it needs the tables built into liboficonv.
+    for d in csmapper esdb; do
+      if [ -e "/usr/local/share/dcmtk-$VERSION/$d" ]; then fail "/usr/local/share/dcmtk-$VERSION/$d should not be installed"; fi
+    done
+    printf '%s\n' \
+      '(0008,0005) CS [ISO_IR 101]' \
+      '(0008,0016) UI [1.2.840.10008.5.1.4.1.1.7]' \
+      '(0010,0020) LO [RC0002]' > latin2.txt
+    printf '(0010,0010) PN [Kowalska^Ma\263gorzata]\n' >> latin2.txt
+    dump2dcm +Ug +te latin2.txt latin2.dcm
+    dcmconv +U8 latin2.dcm utf8.dcm
+    dcmdump utf8.dcm > utf8.txt
+    printf '(0010,0010) PN [Kowalska^Ma\305\202gorzata]' > expected.txt
+    grep -Fq "$(cat expected.txt)" utf8.txt || { grep -F '(0010,0010)' utf8.txt >&2; fail 'PatientName was not converted to UTF-8'; }
+    grep -Fq '(0008,0005) CS [ISO_IR 192]' utf8.txt || { grep -F '(0008,0005)' utf8.txt >&2; fail 'SpecificCharacterSet is not ISO_IR 192'; }
+  - |
+    fail() { echo "$*" >&2; exit 1; }
+    rm -rf media
+    mkdir media
+    cp img.dcm media/IMG00001
+    # +I fills in the type 1 attributes of the directory records that img.dcm lacks.
+    dcmmkdir +I +id media +D media/DICOMDIR IMG00001 > dcmmkdir.log 2>&1 || { cat dcmmkdir.log >&2; fail 'dcmmkdir failed'; }
+    dcmdump media/DICOMDIR > dicomdir.txt
+    for value in 'CS [IMAGE]' 'CS [IMG00001]'; do
+      grep -Fq "$value" dicomdir.txt || { cat dicomdir.txt >&2; fail "DICOMDIR has no $value"; }
+    done
+  - |
+    fail() { echo "$*" >&2; exit 1; }
+    pixels() {
+      rm -rf "px-$1"
+      mkdir "px-$1"
+      dcmdump +W "px-$1" "$1" > /dev/null
+      cmp "px-$1/$1.0.raw" pix.raw || fail "the pixel data of $1 differs from pix.raw"
+    }
+    dump2dcm +Ug +te img.txt second.dcm
+    rm -rf in
+    mkdir in
+    # storescp has no option to bind one address; it listens on every
+    # interface of the container.
+    storescp --output-directory in 11112 > storescp.log 2>&1 &
+    pid=$!
+    stop() { kill "$pid" 2> /dev/null || true; wait "$pid" 2> /dev/null || true; }
+    i=0
+    until echoscu 127.0.0.1 11112 > echoscu.log 2>&1; do
+      i=$((i + 1))
+      if [ "$i" -ge 30 ]; then
+        cat echoscu.log storescp.log >&2
+        stop
+        fail 'storescp did not answer a C-ECHO within 30 seconds'
+      fi
+      sleep 1
+    done
+    storescu 127.0.0.1 11112 img.dcm > storescu.log 2>&1 || { cat storescu.log storescp.log >&2; stop; fail 'storescu failed'; }
+    dcmtk send 127.0.0.1 11112 second.dcm > dcmsend.log 2>&1 || { cat dcmsend.log storescp.log >&2; stop; fail 'dcmtk send failed'; }
+    stop
+    for f in img.dcm second.dcm; do
+      uid=$(dcmdump -q +P 0008,0018 "$f" | sed -n 's/.*\[\(.*\)\].*/\1/p')
+      test -n "$uid" || fail "no SOPInstanceUID in $f"
+      found=$(find in -type f -name "*$uid*")
+      test -n "$found" || { ls -l in >&2; cat storescp.log >&2; fail "storescp did not store $f"; }
+      cp "$found" "received-$f"
+      pixels "received-$f"
+    done
+examples:
+  - title: Print the contents of a DICOM file
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/dcmtk dump image.dcm
+  - title: Render a DICOM image as PNG
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/dcmtk toimg +on image.dcm image.png
+  - title: Send the DICOM files in a directory to a storage server
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/dcmtk send --scan-directories --recurse pacs.example.org 11112 study
+  - title: Receive DICOM files on port 11112 and store them in the current directory
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -p 11112:11112 ghcr.io/randomcontainers/dcmtk storescp 11112
